@@ -49,6 +49,9 @@ struct PreviewResult: Codable {
     let analyzed: Int
     let skipped: Int
     let manualExcluded: Int
+    let deadWhite: Int
+    let deadBlack: Int
+    let rawCompanions: Int
     let isoFlagged: [PreviewExcluded]
     let blurry: [PreviewExcluded]
     let redFlagged: [PreviewFlagged]
@@ -74,9 +77,16 @@ struct PreviewMetric: Codable {
     let iso: Int?
     let captureDate: String?
     let sequenceNumber: Int?
+    let camera: String?
+    let lens: String?
+    let isRaw: Bool
     let isHighISO: Bool
     let isUtility: Bool
     let isDocument: Bool
+    let isDeadWhite: Bool
+    let isDeadBlack: Bool
+    let whiteClippedFraction: Double
+    let blackClippedFraction: Double
     let isRedFlagged: Bool
     let redReasons: [String]
     let isYellowFlagged: Bool
@@ -115,6 +125,13 @@ struct PreviewFile: Codable {
     let focus: Double
     let winner: Bool
     let manualWinner: Bool
+    let deadWhite: Bool
+    let deadBlack: Bool
+    let whiteClippedFraction: Double
+    let blackClippedFraction: Double
+    let isRaw: Bool
+    let camera: String?
+    let lens: String?
 }
 
 enum Renderer {
@@ -146,7 +163,14 @@ enum Renderer {
                         isBlurry: record.isBlurry,
                         focus: (record.sharpness * 1000).rounded() / 1000,
                         winner: record === group.winner,
-                        manualWinner: record === group.winner && record.isUserWinner
+                        manualWinner: record === group.winner && record.isUserWinner,
+                        deadWhite: record.isDeadWhite,
+                        deadBlack: record.isDeadBlack,
+                        whiteClippedFraction: (record.whiteClippedFraction * 10000).rounded() / 10000,
+                        blackClippedFraction: (record.blackClippedFraction * 10000).rounded() / 10000,
+                        isRaw: record.isRaw,
+                        camera: record.camera,
+                        lens: record.lens
                     )
                 }
             )
@@ -172,9 +196,16 @@ enum Renderer {
                     iso: record.iso,
                     captureDate: record.captureDate.map(Self.isoFormatter.string(from:)),
                     sequenceNumber: record.sequenceNumber,
+                    camera: record.camera,
+                    lens: record.lens,
+                    isRaw: record.isRaw,
                     isHighISO: record.isHighISOJPG,
                     isUtility: record.isUtility,
                     isDocument: record.isDocument,
+                    isDeadWhite: record.isDeadWhite,
+                    isDeadBlack: record.isDeadBlack,
+                    whiteClippedFraction: (record.whiteClippedFraction * 10000).rounded() / 10000,
+                    blackClippedFraction: (record.blackClippedFraction * 10000).rounded() / 10000,
                     isRedFlagged: record.isExcludedFromPicking,
                     redReasons: record.redReasons,
                     isYellowFlagged: record.hasYellowFlag,
@@ -197,6 +228,9 @@ enum Renderer {
             analyzed: snapshot.summary.analyzed,
             skipped: snapshot.summary.skipped,
             manualExcluded: snapshot.records.filter(\.isUserExcluded).count,
+            deadWhite: snapshot.summary.deadWhite,
+            deadBlack: snapshot.summary.deadBlack,
+            rawCompanions: snapshot.summary.rawCompanions,
             isoFlagged: isoFlagged,
             blurry: blurry,
             redFlagged: redFlagged,

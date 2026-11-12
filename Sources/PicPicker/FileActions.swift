@@ -132,7 +132,11 @@ enum FileActions {
         return result
     }
 
-    static func plannedNames(for groups: [PhotoGroup]) -> [(ImageRecord, String)] {
+    static func plannedNames(
+        for groups: [PhotoGroup],
+        companions: [ImageRecord] = []
+    ) -> [(ImageRecord, String)] {
+        // 先让所有 RAW 的名字落定，再给配对 JPG 跟名，避免占用同一目录里的名字。
         var plans: [(ImageRecord, String)] = []
         var used: [String: Set<String>] = [:]
         var reserved: [String: Set<String>] = [:]
@@ -144,6 +148,10 @@ enum FileActions {
                 let key = record.url.deletingLastPathComponent().standardizedFileURL.path
                 sourceNamesByDirectory[key, default: []].insert(record.url.lastPathComponent.lowercased())
             }
+        }
+        for companion in companions {
+            let key = companion.url.deletingLastPathComponent().standardizedFileURL.path
+            sourceNamesByDirectory[key, default: []].insert(companion.url.lastPathComponent.lowercased())
         }
 
         for group in groups {
@@ -180,6 +188,29 @@ enum FileActions {
                 used[directoryKey] = usedNames
                 record.targetName = finalName
                 plans.append((record, finalName))
+            }
+        }
+
+        // 配对的 JPG 跟随 RAW 的名字：同目录、同组号、同摘要，只保留各自的扩展名，
+        // 这样 CR3 与 JPG 在 Finder/Lightroom 里始终成对出现。
+        for (record, target) in plans {
+            for companion in companions where companion.companionOf === record {
+                let directory = companion.url.deletingLastPathComponent()
+                let directoryKey = directory.standardizedFileURL.path
+                let ext = companion.url.pathExtension
+                let base = (target as NSString).deletingPathExtension
+                var candidate = ext.isEmpty ? base : "\(base).\(ext)"
+                var suffix = 2
+                var usedNames = used[directoryKey] ?? []
+                let reservedNames = reserved[directoryKey] ?? []
+                while usedNames.contains(candidate.lowercased())
+                    || reservedNames.contains(candidate.lowercased()) {
+                    candidate = ext.isEmpty ? "\(base)-\(suffix)" : "\(base)-\(suffix).\(ext)"
+                    suffix += 1
+                }
+                usedNames.insert(candidate.lowercased())
+                used[directoryKey] = usedNames
+                companion.targetName = candidate
             }
         }
         return plans
@@ -228,7 +259,9 @@ enum FileActions {
 
         var staging: [(record: ImageRecord, original: URL, temporary: URL, target: URL, directory: String)] = []
         // 只给会被整理的组算名字，避免改动因排除而不再展示的记录。
-        let plans = plannedNames(for: groups)
+        let plans = plannedNames(for: groups) + records
+            .filter { $0.isCompanion && $0.targetName != nil }
+            .map { ($0, $0.targetName ?? $0.originalName) }
         for record in records where record.groupID == nil {
             record.targetName = nil
         }

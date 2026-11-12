@@ -39,16 +39,29 @@ final class AppModel: @unchecked Sendable {
     private var similarityIndex: SimilarityIndex?
     private var recomputeGeneration = 0
     private var baseGroups: [PhotoGroup] = []
+    /// 跟随 RAW 改名的同名 JPG，不参与评分和分组。
+    private var rawCompanions: [ImageRecord] = []
     var autoApply: Bool
     var jsonOutput: Bool
     var dryRun: Bool
+    var preferRaw: Bool
+    var cameraBlur: Bool
     private var isPreview = false
 
-    init(threshold: Double, autoApply: Bool, jsonOutput: Bool = false, dryRun: Bool = false) {
+    init(
+        threshold: Double,
+        autoApply: Bool,
+        jsonOutput: Bool = false,
+        dryRun: Bool = false,
+        preferRaw: Bool = false,
+        cameraBlur: Bool = true
+    ) {
         self.threshold = threshold
         self.autoApply = autoApply
         self.jsonOutput = jsonOutput
         self.dryRun = dryRun
+        self.preferRaw = preferRaw
+        self.cameraBlur = cameraBlur
     }
 
     func snapshot() -> Snapshot {
@@ -84,6 +97,7 @@ final class AppModel: @unchecked Sendable {
         progressNote = "正在扫描文件夹…"
         records = []
         groups = []
+        rawCompanions = []
         summary = AnalysisSummary()
         similarityIndex = nil
         applyReport = nil
@@ -100,10 +114,14 @@ final class AppModel: @unchecked Sendable {
         Task.detached(priority: .userInitiated) { [weak self] in
             guard let self else { return }
             do {
-                let urls = try ImageScanner.scan(folder: folder)
+                let scanned = try ImageScanner.scan(folder: folder)
+                let pairing = self.preferRaw
+                    ? RawPairing.split(scanned)
+                    : RawPairing.Split(urls: scanned, companions: [:])
+                let urls = pairing.urls
                 self.mutate {
-                    self.total = urls.count
-                    self.progressNote = "共 \(urls.count) 张图片"
+                    self.total = scanned.count
+                    self.progressNote = "共 \(scanned.count) 张图片"
                     self.stage = urls.isEmpty ? .reviewing : .analyzing
                     if urls.isEmpty {
                         self.endedAt = Date()
@@ -115,7 +133,7 @@ final class AppModel: @unchecked Sendable {
                     self.mutate {
                         self.completed = completed
                         self.currentName = name
-                        self.progressNote = "提取指纹 · 美学评分 · EXIF/ISO · 对焦/曝光"
+                        self.progressNote = "提取指纹 · 美学评分 · EXIF/ISO · 对焦/曝光 · 死黑死白"
                     }
                 }
 
@@ -146,25 +164,43 @@ final class AppModel: @unchecked Sendable {
                     return true
                 }
                 let focusMedian = median(judgeable.map(\.sharpnessRaw))
-                let cutoff = min(focusMedian * Preprocess.blurRelativeCutoff, Preprocess.blurRawCap)
+                // 不同机型/镜头的锐度口径不同，按同机型同镜头的样本单独取中位数；
+                // 样本太少时退回全批中位数，结果更稳定。
+                var cameraMedians: [String: Double] = [:]
+                if self.cameraBlur {
+                    for (key, members) in Dictionary(grouping: judgeable, by: \.calibrationGroup)
+                    where members.count >= 8 {
+                        cameraMedians[key] = median(members.map(\.sharpnessRaw))
+                    }
+                }
                 let judgeableIDs = Set(judgeable.map(ObjectIdentifier.init))
                 for record in candidates {
-                    record.isBlurry = judgeableIDs.contains(ObjectIdentifier(record))
-                        && record.sharpnessRaw < cutoff
+                    guard judgeableIDs.contains(ObjectIdentifier(record)) else { continue }
+                    let base = cameraMedians[record.calibrationGroup] ?? focusMedian
+                    record.isBlurry = record.sharpnessRaw
+                        < min(base * Preprocess.blurRelativeCutoff, Preprocess.blurRawCap)
                 }
 
                 let pickable = candidates.filter { !$0.isBlurry }
                 let index = SimilarityIndex(records: pickable)
                 let grouped = index.groups(threshold: self.currentThreshold)
-                _ = FileActions.plannedNames(for: grouped)
+                let companions = self.makeCompanions(
+                    for: ordered,
+                    pairing: pairing.companions,
+                    folder: folder
+                )
+                _ = FileActions.plannedNames(for: grouped, companions: companions)
 
                 let analyzedCount = ordered.filter { $0.isAnalyzed }.count
                 let isoFlagged = ordered.filter { $0.isHighISOJPG }.count
                 let blurry = ordered.filter { $0.isBlurry }.count
                 var nextSummary = AnalysisSummary()
-                nextSummary.totalFound = urls.count
+                nextSummary.totalFound = scanned.count
                 nextSummary.analyzed = analyzedCount
                 nextSummary.skipped = analyzed.count - analyzedCount
+                nextSummary.rawCompanions = companions.count
+                nextSummary.deadBlack = ordered.filter { $0.isDeadBlack }.count
+                nextSummary.deadWhite = ordered.filter { $0.isDeadWhite }.count
                 nextSummary.isoFlagged = isoFlagged
                 nextSummary.redFlagged = ordered.filter { $0.isExcludedFromPicking }.count
                 nextSummary.yellowFlagged = ordered.filter {
@@ -176,11 +212,12 @@ final class AppModel: @unchecked Sendable {
                 nextSummary.groupedPhotos = grouped.reduce(0) { $0 + $1.records.count }
 
                 self.mutate {
-                    self.records = ordered
+                    self.records = ordered + companions
                     self.similarityIndex = index
                     self.baseGroups = grouped
                     self.groups = self.refine(groups: grouped)
                     self.summary = nextSummary
+                    self.rawCompanions = companions
                     self.stage = .reviewing
                     self.endedAt = Date()
                     self.progressNote = ""
@@ -230,8 +267,32 @@ final class AppModel: @unchecked Sendable {
         let refined = GroupEditor.refine(groups: groups) { lhs, rhs in
             index?.distance(between: lhs, and: rhs)
         }
-        _ = FileActions.plannedNames(for: refined)
+        for group in refined {
+            for companion in rawCompanions where companion.companionOf === group.winner {
+                companion.groupID = group.id
+            }
+        }
+        _ = FileActions.plannedNames(for: refined, companions: rawCompanions)
         return refined
+    }
+
+    /// 把 RAW 的配对 JPG 建成跟随记录：继承排序位置与组号，但自己不参与选片。
+    private func makeCompanions(
+        for ordered: [ImageRecord],
+        pairing: [String: [URL]],
+        folder: URL
+    ) -> [ImageRecord] {
+        var companions: [ImageRecord] = []
+        for record in ordered {
+            guard let urls = pairing[record.url.standardizedFileURL.path] else { continue }
+            for url in urls {
+                let companion = ImageRecord(url: url)
+                companion.relativeDirectory = relativeDirectory(of: url, in: folder)
+                companion.companionOf = record
+                companions.append(companion)
+            }
+        }
+        return companions.sorted { naturalCompare($0.sortKey, $1.sortKey) }
     }
 
     private func regenerateGroups() {

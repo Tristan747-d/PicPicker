@@ -35,6 +35,8 @@ private struct DecodedImage {
     let image: CGImage
     let iso: Int?
     let captureDate: Date?
+    let camera: String?
+    let lens: String?
 }
 
 enum ImageAnalyzer {
@@ -91,6 +93,8 @@ enum ImageAnalyzer {
             record.iso = decoded.iso
             record.isJPG = ["jpg", "jpeg", "jpe"].contains(url.pathExtension.lowercased())
             record.captureDate = decoded.captureDate
+            record.camera = decoded.camera
+            record.lens = decoded.lens
             guard let gray = GrayImage(cgImage: image) else {
                 throw AnalyzerError.cannotRender(url.lastPathComponent)
             }
@@ -138,6 +142,22 @@ enum ImageAnalyzer {
                 record.redReasons.append("极端欠曝")
             }
 
+            let tone = ToneAnalyzer.analyze(url: url, isRaw: record.isRaw, image: image)
+            record.whiteClippedFraction = tone.whiteFraction
+            record.blackClippedFraction = tone.blackFraction
+            record.isDeadWhite = tone.isDeadWhite
+            record.isDeadBlack = tone.isDeadBlack
+            if tone.isDeadWhite {
+                record.redReasons.append(
+                    "死白 \(Int((tone.whiteFraction * 100).rounded()))%"
+                )
+            }
+            if tone.isDeadBlack {
+                record.redReasons.append(
+                    "死黑 \(Int((tone.blackFraction * 100).rounded()))%"
+                )
+            }
+
             let salientRect = metrics.salientRect.flatMap {
                 gray.expandedPixelRect(fromNormalized: $0, padding: 0.18)
             }
@@ -173,8 +193,32 @@ enum ImageAnalyzer {
         return DecodedImage(
             image: image,
             iso: readISO(from: source),
-            captureDate: readCaptureDate(from: source)
+            captureDate: readCaptureDate(from: source),
+            camera: readCamera(from: source),
+            lens: readLens(from: source)
         )
+    }
+
+    private static func readCamera(from source: CGImageSource) -> String? {
+        guard let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              let tiff = properties[kCGImagePropertyTIFFDictionary] as? [CFString: Any] else {
+            return nil
+        }
+        let make = (tiff[kCGImagePropertyTIFFMake] as? String)?.trimmingCharacters(in: .whitespaces)
+        let model = (tiff[kCGImagePropertyTIFFModel] as? String)?.trimmingCharacters(in: .whitespaces)
+        let parts = [make, model].compactMap { $0 }.filter { !$0.isEmpty }
+        guard !parts.isEmpty else { return nil }
+        return parts.joined(separator: " ")
+    }
+
+    private static func readLens(from source: CGImageSource) -> String? {
+        guard let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              let exif = properties[kCGImagePropertyExifDictionary] as? [CFString: Any],
+              let lens = exif[kCGImagePropertyExifLensModel] as? String else {
+            return nil
+        }
+        let trimmed = lens.trimmingCharacters(in: .whitespaces)
+        return trimmed.isEmpty ? nil : trimmed
     }
 
     private static func readISO(from source: CGImageSource) -> Int? {

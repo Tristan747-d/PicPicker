@@ -9,6 +9,8 @@ struct Options {
     var dryRun: Bool = false
     var json: Bool = false
     var undo: Bool = false
+    var preferRaw: Bool = false
+    var globalBlur: Bool = false
     var isoLimit: Int = 16_000
     var blurRatio: Double = 0.50
     var eyeRatio: Double = 0.20
@@ -26,6 +28,8 @@ struct Options {
       --dry-run           只分析并输出计划，不修改任何文件
       --json              与 --dry-run 一起使用，输出机器可读 JSON
       --undo              撤销本文件夹上一次重命名
+      --prefer-raw        同名的 RAW+JPG 只分析 RAW，JPG 跟随 RAW 一起改名
+      --global-blur       关闭按机型的虚焦校准，改用全批中位数
       -h, --help          显示帮助
     """
 
@@ -75,6 +79,10 @@ struct Options {
                 options.json = true
             case "--undo":
                 options.undo = true
+            case "--prefer-raw":
+                options.preferRaw = true
+            case "--global-blur":
+                options.globalBlur = true
             case "-h", "--help":
                 options.showHelp = true
             default:
@@ -112,6 +120,11 @@ final class ImageRecord: @unchecked Sendable {
     var faceCount = 0
     var iso: Int?
     var isJPG = false
+    var isRaw = false
+    var camera: String?
+    var lens: String?
+    /// 与 RAW 同名的 JPG：不单独分析，跟随 RAW 一起改名。
+    var companionOf: ImageRecord?
     var isBlurry = false
     var captureDate: Date?
     var sequenceKey: String?
@@ -127,6 +140,11 @@ final class ImageRecord: @unchecked Sendable {
     var groupID: Int?
     var targetName: String?
     var distanceToBest: Double?
+    var blackClippedFraction = 0.0
+    var whiteClippedFraction = 0.0
+    /// 局部死黑/死白：过曝或欠曝后仍无结构的大片区域。
+    var isDeadBlack = false
+    var isDeadWhite = false
     /// 审阅阶段手动排除：不参与重命名，也不写入任何标签。
     var isUserExcluded = false
     /// 审阅阶段手动指定为组内最佳。
@@ -137,7 +155,14 @@ final class ImageRecord: @unchecked Sendable {
     init(url: URL) {
         self.url = url
         self.originalName = url.lastPathComponent
+        self.isRaw = Self.rawExtensions.contains(url.pathExtension.lowercased())
+        self.isJPG = Self.jpegExtensions.contains(url.pathExtension.lowercased())
     }
+
+    static let rawExtensions: Set<String> = [
+        "dng", "cr2", "cr3", "nef", "arw", "raf", "orf", "rw2", "pef", "srw", "nrw", "rwl", "3fr", "erf"
+    ]
+    static let jpegExtensions: Set<String> = ["jpg", "jpeg", "jpe"]
 
     var isAnalyzed: Bool {
         featurePrint != nil
@@ -153,7 +178,7 @@ final class ImageRecord: @unchecked Sendable {
 
     /// 红标照片不参与重复检测和选片；黄标照片照常参与。
     var isExcludedFromPicking: Bool {
-        isHighISOJPG || !redReasons.isEmpty
+        isHighISOJPG || !redReasons.isEmpty || isDeadWhite || isDeadBlack
     }
 
     var redReasonText: String {
@@ -163,6 +188,16 @@ final class ImageRecord: @unchecked Sendable {
     var yellowReasonText: String {
         yellowReasons.joined(separator: "、")
     }
+
+    /// 虚焦校准分组：同一机型、同一镜头的照片亮度与锐度口径一致。
+    var calibrationGroup: String {
+        let body = camera ?? "unknown"
+        let optic = lens ?? "unknown"
+        return "\(body)|\(optic)|\(isRaw ? "raw" : "8bit")"
+    }
+
+    /// RAW+JPG 同名配对里的 JPG：不单独分析，跟随 RAW 一起改名。
+    var isCompanion: Bool { companionOf != nil }
 
     /// 相对根目录的原始路径，例如 `2026-11-11/Day2/DSC3345.jpg`
     var sortKey: String {
@@ -207,6 +242,9 @@ struct AnalysisSummary {
     var isoFlagged: Int = 0
     var redFlagged: Int = 0
     var yellowFlagged: Int = 0
+    var deadBlack: Int = 0
+    var deadWhite: Int = 0
+    var rawCompanions: Int = 0
     var blurry: Int = 0
     var pickable: Int = 0
     var groups: Int = 0

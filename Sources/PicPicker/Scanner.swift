@@ -53,3 +53,39 @@ func relativePath(of url: URL, in base: URL) -> String {
 func relativeDirectory(of url: URL, in base: URL) -> String {
     relativePath(of: url.deletingLastPathComponent(), in: base)
 }
+
+/// RAW+JPG 同名配对：同目录、同文件名（不含扩展名）时，只分析 RAW。
+enum RawPairing {
+    struct Split {
+        var urls: [URL]
+        /// RAW 标准化路径 → 需要跟随改名的 JPG。
+        var companions: [String: [URL]]
+    }
+
+    static func split(_ urls: [URL]) -> Split {
+        var byKey: [String: (raw: [URL], jpeg: [URL])] = [:]
+        for url in urls {
+            let ext = url.pathExtension.lowercased()
+            let base = url.deletingPathExtension().lastPathComponent.lowercased()
+            let key = url.deletingLastPathComponent().standardizedFileURL.path + "|" + base
+            if ImageRecord.rawExtensions.contains(ext) {
+                byKey[key, default: ([], [])].raw.append(url)
+            } else if ImageRecord.jpegExtensions.contains(ext) {
+                byKey[key, default: ([], [])].jpeg.append(url)
+            }
+        }
+
+        var companions: [String: [URL]] = [:]
+        var pairedJPEGs = Set<URL>()
+        for pair in byKey.values {
+            guard pair.raw.count == 1, let raw = pair.raw.first else { continue }
+            companions[raw.standardizedFileURL.path] = pair.jpeg
+            pairedJPEGs.formUnion(pair.jpeg)
+        }
+
+        return Split(
+            urls: urls.filter { !pairedJPEGs.contains($0) },
+            companions: companions
+        )
+    }
+}

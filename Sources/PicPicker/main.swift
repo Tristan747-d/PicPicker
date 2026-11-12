@@ -36,7 +36,9 @@ let model = AppModel(
     threshold: options.threshold,
     autoApply: options.apply || (!isInteractive && !options.dryRun),
     jsonOutput: options.json,
-    dryRun: options.dryRun
+    dryRun: options.dryRun,
+    preferRaw: options.preferRaw,
+    cameraBlur: !options.globalBlur
 )
 
 if folder == nil, !isInteractive, !options.undo {

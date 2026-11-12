@@ -273,4 +273,68 @@ final class PicPickerTests: XCTestCase {
         }
         return green
     }
+
+    func testToneAnalyzerMarksFlatWhiteAsDead() throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("tone-\(UUID().uuidString).jpg")
+        let image = try XCTUnwrap(Self.makeImage(width: 120, height: 120) { context in
+            context.setFillColor(CGColor(red: 1, green: 1, blue: 1, alpha: 1))
+            context.fill(CGRect(x: 0, y: 0, width: 120, height: 120))
+            context.setFillColor(CGColor(red: 0.2, green: 0.2, blue: 0.2, alpha: 1))
+            context.fill(CGRect(x: 0, y: 0, width: 120, height: 40))
+        })
+        let tone = ToneAnalyzer.analyze(url: url, isRaw: false, image: image)
+        XCTAssertTrue(tone.isDeadWhite, "大片纯白应判为死白")
+        XCTAssertFalse(tone.isDeadBlack)
+        XCTAssertGreaterThan(tone.whiteFraction, 0.5)
+    }
+
+    func testToneAnalyzerKeepsSliverWhite() throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("tone-\(UUID().uuidString).jpg")
+        let image = try XCTUnwrap(Self.makeImage(width: 120, height: 120) { context in
+            context.setFillColor(CGColor(red: 0.4, green: 0.4, blue: 0.4, alpha: 1))
+            context.fill(CGRect(x: 0, y: 0, width: 120, height: 120))
+            // 2% 面积的高光（灯光、反光），不应该被判成死白。
+            context.setFillColor(CGColor(red: 1, green: 1, blue: 1, alpha: 1))
+            context.fill(CGRect(x: 0, y: 110, width: 120, height: 3))
+        })
+        let tone = ToneAnalyzer.analyze(url: url, isRaw: false, image: image)
+        XCTAssertFalse(tone.isDeadWhite)
+        XCTAssertGreaterThan(tone.whiteFraction, 0)
+    }
+
+    func testDeadBlackAndWhiteAreExcludedFromPicking() {
+        let record = ImageRecord(url: URL(fileURLWithPath: "/tmp/DSC3345.jpg"))
+        XCTAssertFalse(record.isExcludedFromPicking)
+        record.isDeadWhite = true
+        XCTAssertTrue(record.isExcludedFromPicking)
+        record.isDeadWhite = false
+        record.isDeadBlack = true
+        XCTAssertTrue(record.isExcludedFromPicking)
+    }
+
+    func testRawJpegPairUsesRawOnly() {
+        let raw = URL(fileURLWithPath: "/tmp/IMG_4498.CR3")
+        let jpeg = URL(fileURLWithPath: "/tmp/IMG_4498.JPG")
+        let raw2 = URL(fileURLWithPath: "/tmp/IMG_4502.NEF")
+        let lone = URL(fileURLWithPath: "/tmp/DSC_0151.JPG")
+        let split = RawPairing.split([raw, jpeg, raw2, lone])
+        XCTAssertEqual(split.urls.map(\.lastPathComponent).sorted(), ["DSC_0151.JPG", "IMG_4498.CR3", "IMG_4502.NEF"])
+        XCTAssertEqual(split.companions[raw.standardizedFileURL.path]?.map(\.lastPathComponent), ["IMG_4498.JPG"])
+        XCTAssertEqual(split.companions[raw2.standardizedFileURL.path], [])
+    }
+
+    func testCompanionFollowsRawTargetName() {
+        let raw = ImageRecord(url: URL(fileURLWithPath: "/tmp/IMG_4498.CR3"))
+        let group = PhotoGroup(id: 3, records: [raw], winner: raw)
+        let jpeg = ImageRecord(url: URL(fileURLWithPath: "/tmp/IMG_4498.JPG"))
+        jpeg.companionOf = raw
+        raw.groupID = 3
+        jpeg.groupID = 3
+
+        let plans = FileActions.plannedNames(for: [group], companions: [jpeg])
+        XCTAssertEqual(plans.first { $0.0 === raw }?.1, "3-IMG_4498.CR3")
+        XCTAssertEqual(jpeg.targetName, "3-IMG_4498.JPG")
+    }
 }
