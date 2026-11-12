@@ -78,7 +78,7 @@ enum FileActions {
     static func preprocess(records: [ImageRecord], root: URL) -> PreprocessResult {
         var result = PreprocessResult()
 
-        for record in records where record.isAnalyzed {
+        for record in records where record.isAnalyzed && !record.isUserExcluded {
             if record.isExcludedFromPicking {
                 do {
                     let previousTags = FinderTags.read(from: record.url)
@@ -201,12 +201,16 @@ enum FileActions {
         }
         report.renamedCount = report.renames.count
         report.taggedCount = groups.count
-        report.highISOMarkedCount = records.filter { $0.isHighISOJPG }.count
-        report.redTaggedCount = records.filter { $0.isAnalyzed && $0.isExcludedFromPicking }.count
-        report.yellowTaggedCount = records.filter {
-            $0.isAnalyzed && !$0.isExcludedFromPicking && $0.hasYellowFlag
+        report.highISOMarkedCount = records.filter {
+            $0.isHighISOJPG && !$0.isUserExcluded
         }.count
-        report.movedToBlurryCount = records.filter { $0.isBlurry }.count
+        report.redTaggedCount = records.filter {
+            $0.isAnalyzed && $0.isExcludedFromPicking && !$0.isUserExcluded
+        }.count
+        report.yellowTaggedCount = records.filter {
+            $0.isAnalyzed && !$0.isExcludedFromPicking && $0.hasYellowFlag && !$0.isUserExcluded
+        }.count
+        report.movedToBlurryCount = records.filter { $0.isBlurry && !$0.isUserExcluded }.count
         return report
     }
 
@@ -214,14 +218,20 @@ enum FileActions {
         var report = ApplyReport()
         let root = folder.standardizedFileURL
         let preprocessResult = preprocess(records: records, root: root)
-        report.highISOMarkedCount = records.filter { $0.isAnalyzed && $0.isHighISOJPG }.count
+        report.highISOMarkedCount = records.filter {
+            $0.isAnalyzed && $0.isHighISOJPG && !$0.isUserExcluded
+        }.count
         report.redTaggedCount = preprocessResult.redTagChanges.count
         report.yellowTaggedCount = preprocessResult.yellowTagChanges.count
         report.movedToBlurryCount = preprocessResult.moves.count
         report.failures.append(contentsOf: preprocessResult.failures)
 
         var staging: [(record: ImageRecord, original: URL, temporary: URL, target: URL, directory: String)] = []
+        // 只给会被整理的组算名字，避免改动因排除而不再展示的记录。
         let plans = plannedNames(for: groups)
+        for record in records where record.groupID == nil {
+            record.targetName = nil
+        }
 
         for (record, targetName) in plans {
             let fileDirectory = record.url.deletingLastPathComponent()

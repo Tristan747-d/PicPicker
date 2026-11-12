@@ -41,6 +41,14 @@ struct SimilarityIndex {
         return (try? lhs.distance(to: rhs)) ?? 1
     }
 
+    func distance(between lhs: ImageRecord, and rhs: ImageRecord) -> Double? {
+        guard let left = records.firstIndex(where: { $0 === lhs }),
+              let right = records.firstIndex(where: { $0 === rhs }) else {
+            return nil
+        }
+        return distance(left, right)
+    }
+
     func groups(threshold: Double) -> [PhotoGroup] {
         guard count > 0 else { return [] }
 
@@ -222,5 +230,53 @@ struct SimilarityIndex {
             }
             record.score = clamp(score)
         }
+    }
+}
+
+/// 把审阅阶段的人工选择（排除 / 指定最佳）应用到分组结果。
+enum GroupEditor {
+    static func refine(
+        groups: [PhotoGroup],
+        distance: (ImageRecord, ImageRecord) -> Double?
+    ) -> [PhotoGroup] {
+        var refined: [(members: [ImageRecord], winner: ImageRecord)] = []
+
+        for group in groups {
+            let members = group.records.filter { !$0.isUserExcluded }
+            guard members.count > 1 else { continue }
+
+            let pinned = members.filter(\.isUserWinner)
+            let candidates = pinned.isEmpty ? members : pinned
+            let winner = candidates.max { isWorse($0, than: $1) } ?? members[0]
+            refined.append((members, winner))
+        }
+
+        refined.sort { lhs, rhs in
+            let left = lhs.members.map(\.sortKey).sorted(by: naturalCompare).first ?? ""
+            let right = rhs.members.map(\.sortKey).sorted(by: naturalCompare).first ?? ""
+            return naturalCompare(left, right)
+        }
+
+        return refined.enumerated().map { offset, entry in
+            let id = offset + 1
+            for member in entry.members {
+                member.groupID = id
+                member.isUserWinner = member === entry.winner && member.isUserWinner
+                member.distanceToBest = member === entry.winner
+                    ? 0
+                    : distance(member, entry.winner)
+            }
+            return PhotoGroup(id: id, records: entry.members, winner: entry.winner)
+        }
+    }
+
+    private static func isWorse(_ lhs: ImageRecord, than rhs: ImageRecord) -> Bool {
+        if abs(lhs.score - rhs.score) > 0.0001 {
+            return lhs.score < rhs.score
+        }
+        if abs(lhs.sharpness - rhs.sharpness) > 0.0001 {
+            return lhs.sharpness < rhs.sharpness
+        }
+        return naturalCompare(rhs.sortKey, lhs.sortKey)
     }
 }

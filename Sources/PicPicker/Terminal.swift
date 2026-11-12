@@ -168,7 +168,7 @@ final class RawTerminal {
     }
 }
 
-enum Key {
+enum Key: Equatable {
     case up
     case down
     case left
@@ -432,5 +432,36 @@ enum Clipboard {
     static func copy(_ text: String) {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)
+    }
+}
+
+enum Finder {
+    /// 在 Finder 中显示并选中文件；已经打开的窗口会直接切到前台。
+    static func reveal(_ url: URL) {
+        let standardized = url.standardizedFileURL
+        let workspace = NSWorkspace.shared
+        if workspace.urlForApplication(withBundleIdentifier: "com.apple.finder") == nil {
+            workspace.open(standardized.deletingLastPathComponent())
+            return
+        }
+
+        let script = """
+        tell application "Finder"
+            activate
+            reveal POSIX file "\(AppleScriptEscaper.escape(standardized.path))"
+        end tell
+        """
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        process.arguments = ["-e", script]
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        if (try? process.run()) != nil {
+            process.waitUntilExit()
+            if process.terminationStatus == 0 {
+                return
+            }
+        }
+        workspace.open(standardized.deletingLastPathComponent())
     }
 }

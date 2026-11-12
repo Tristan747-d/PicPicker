@@ -38,6 +38,7 @@ final class AppModel: @unchecked Sendable {
     private var progressNote = ""
     private var similarityIndex: SimilarityIndex?
     private var recomputeGeneration = 0
+    private var baseGroups: [PhotoGroup] = []
     var autoApply: Bool
     var jsonOutput: Bool
     var dryRun: Bool
@@ -177,7 +178,8 @@ final class AppModel: @unchecked Sendable {
                 self.mutate {
                     self.records = ordered
                     self.similarityIndex = index
-                    self.groups = grouped
+                    self.baseGroups = grouped
+                    self.groups = self.refine(groups: grouped)
                     self.summary = nextSummary
                     self.stage = .reviewing
                     self.endedAt = Date()
@@ -214,10 +216,87 @@ final class AppModel: @unchecked Sendable {
             _ = FileActions.plannedNames(for: grouped)
             self.mutate {
                 guard self.recomputeGeneration == generation else { return }
-                self.groups = grouped
-                self.summary.groups = grouped.count
-                self.summary.groupedPhotos = grouped.reduce(0) { $0 + $1.records.count }
+                self.baseGroups = grouped
+                self.groups = self.refine(groups: grouped)
+                self.summary.groups = self.groups.count
+                self.summary.groupedPhotos = self.groups.reduce(0) { $0 + $1.records.count }
             }
+        }
+    }
+
+    /// 只保留仍是选定最佳的成员标记，避免排除后最佳被钉在已隐藏的照片上。
+    private func refine(groups: [PhotoGroup]) -> [PhotoGroup] {
+        let index = similarityIndex
+        let refined = GroupEditor.refine(groups: groups) { lhs, rhs in
+            index?.distance(between: lhs, and: rhs)
+        }
+        _ = FileActions.plannedNames(for: refined)
+        return refined
+    }
+
+    private func regenerateGroups() {
+        groups = refine(groups: baseGroups)
+        summary.groups = groups.count
+        summary.groupedPhotos = groups.reduce(0) { $0 + $1.records.count }
+    }
+
+    func setExcluded(_ record: ImageRecord, excluded: Bool) {
+        mutate {
+            record.isUserExcluded = excluded
+            if excluded {
+                record.isUserWinner = false
+            }
+            regenerateGroups()
+        }
+    }
+
+    func setWinner(_ record: ImageRecord) {
+        mutate {
+            guard let group = groups.first(where: { group in
+                group.records.contains { $0 === record }
+            }) else {
+                return
+            }
+            for member in group.records {
+                member.isUserWinner = member === record
+            }
+            record.isUserExcluded = false
+            regenerateGroups()
+        }
+    }
+
+    func rotateWinner(of group: PhotoGroup, forward: Bool) {
+        mutate {
+            let sorted = group.sortedRecords
+            guard sorted.count > 1 else { return }
+            let current = sorted.firstIndex { $0 === group.winner } ?? 0
+            let offset = forward ? 1 : -1
+            let next = sorted[(current + offset + sorted.count) % sorted.count]
+            for member in sorted {
+                member.isUserWinner = member === next
+                member.isUserExcluded = false
+            }
+            regenerateGroups()
+        }
+    }
+
+    func skipGroup(_ group: PhotoGroup) {
+        mutate {
+            for member in group.records {
+                member.isUserExcluded = true
+                member.isUserWinner = false
+            }
+            regenerateGroups()
+        }
+    }
+
+    func resetManualSelections() {
+        mutate {
+            for record in records {
+                record.isUserExcluded = false
+                record.isUserWinner = false
+            }
+            regenerateGroups()
         }
     }
 
@@ -228,7 +307,8 @@ final class AppModel: @unchecked Sendable {
             return
         }
         let flaggedCount = records.filter {
-            $0.isExcludedFromPicking || $0.isBlurry || $0.hasYellowFlag
+            !$0.isUserExcluded
+                && ($0.isExcludedFromPicking || $0.isBlurry || $0.hasYellowFlag)
         }.count
         guard !groups.isEmpty || flaggedCount > 0 else {
             stage = .finished

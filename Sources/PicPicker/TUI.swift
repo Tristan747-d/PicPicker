@@ -48,6 +48,7 @@ struct PreviewResult: Codable {
     let totalFound: Int
     let analyzed: Int
     let skipped: Int
+    let manualExcluded: Int
     let isoFlagged: [PreviewExcluded]
     let blurry: [PreviewExcluded]
     let redFlagged: [PreviewFlagged]
@@ -113,6 +114,7 @@ struct PreviewFile: Codable {
     let isBlurry: Bool
     let focus: Double
     let winner: Bool
+    let manualWinner: Bool
 }
 
 enum Renderer {
@@ -143,7 +145,8 @@ enum Renderer {
                         isHighISO: record.isHighISOJPG,
                         isBlurry: record.isBlurry,
                         focus: (record.sharpness * 1000).rounded() / 1000,
-                        winner: record === group.winner
+                        winner: record === group.winner,
+                        manualWinner: record === group.winner && record.isUserWinner
                     )
                 }
             )
@@ -193,6 +196,7 @@ enum Renderer {
             totalFound: snapshot.summary.totalFound,
             analyzed: snapshot.summary.analyzed,
             skipped: snapshot.summary.skipped,
+            manualExcluded: snapshot.records.filter(\.isUserExcluded).count,
             isoFlagged: isoFlagged,
             blurry: blurry,
             redFlagged: redFlagged,
@@ -437,6 +441,57 @@ enum TUI {
                     model.beginApply(preview: true)
                     lastDrawn = ""
                 }
+            case .character("["), .character("]"):
+                let forward = key == Key.character("]")
+                if snapshot.stage == .reviewing,
+                   snapshot.groups.indices.contains(selectedGroup) {
+                    model.rotateWinner(
+                        of: snapshot.groups[selectedGroup],
+                        forward: forward
+                    )
+                    lastDrawn = ""
+                }
+            case .character("x"):
+                if snapshot.stage == .reviewing,
+                   snapshot.groups.indices.contains(selectedGroup) {
+                    model.setExcluded(snapshot.groups[selectedGroup].winner, excluded: true)
+                    selectedGroup = min(selectedGroup, max(0, snapshot.groups.count - 2))
+                    lastDrawn = ""
+                }
+            case .character("s"):
+                if snapshot.stage == .reviewing,
+                   snapshot.groups.indices.contains(selectedGroup) {
+                    model.skipGroup(snapshot.groups[selectedGroup])
+                    selectedGroup = min(selectedGroup, max(0, snapshot.groups.count - 2))
+                    lastDrawn = ""
+                }
+            case .character("R"):
+                if snapshot.stage == .reviewing {
+                    Terminal.write("\u{1B}[?25h")
+                    let shouldReset = Input.confirm("清除所有手动改选和排除？")
+                    Terminal.write(Ansi.hideCursor)
+                    if shouldReset {
+                        model.resetManualSelections()
+                    }
+                    lastDrawn = ""
+                }
+            case .character("f"):
+                let target: URL?
+                if snapshot.stage == .reviewing,
+                   snapshot.groups.indices.contains(selectedGroup) {
+                    target = snapshot.groups[selectedGroup].winner.url
+                } else {
+                    target = snapshot.folder
+                }
+                if let target {
+                    Finder.reveal(target)
+                }
+            case .character("v"):
+                if snapshot.stage == .reviewing,
+                   snapshot.groups.indices.contains(selectedGroup) {
+                    previewOverlay(model: model, group: snapshot.groups[selectedGroup])
+                    lastDrawn = ""
+                }
             case .character("o"):
                 if snapshot.stage == .reviewing,
                    snapshot.groups.indices.contains(selectedGroup) {
@@ -525,6 +580,107 @@ enum TUI {
 
     static func confirmExit() -> Bool {
         Input.confirm("识别结果尚未执行，确定退出？", defaultYes: false)
+    }
+
+    /// 全屏查看当前组每张照片的终端真彩色预览，翻页不会改变任何选片结果。
+    static func previewOverlay(model: AppModel, group: PhotoGroup) {
+        let records = group.sortedRecords
+        guard !records.isEmpty else { return }
+
+        var cursor = records.firstIndex { $0 === group.winner } ?? 0
+        var rendered: [String?] = []
+        let width = Terminal.width
+        let height = Terminal.height
+
+        defer {
+            Terminal.clear()
+            Terminal.write(Ansi.hideCursor)
+        }
+
+        func lines(for index: Int) -> [String] {
+            if rendered.count != records.count {
+                rendered = Array(repeating: nil, count: records.count)
+            }
+            if let cached = rendered[index] {
+                return cached.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+            }
+
+            // 字符格约 2:1 高宽比，用满宽和剩余行数就是最大的物理像素面积。
+            let rows = max(5, height - 9)
+            let columns = max(20, min(width - 4, rows * 2))
+            let picture = ImagePreview.render(url: records[index].url, columns: columns, rows: rows)
+            guard let picture else {
+                return fallbackLines(for: records[index])
+            }
+            rendered[index] = picture.joined(separator: "\n")
+            return picture
+        }
+
+        while true {
+            let record = records[cursor]
+            var body: [String] = []
+            body.append(
+                "  \(Ansi.bold)\(record.plannedDisplayPath)\(Ansi.reset)"
+                    + (record === group.winner ? "  \(Ansi.green)● 最佳\(Ansi.reset)" : "")
+            )
+            body.append("  \(scoreLine(record))")
+            for line in lines(for: cursor) {
+                body.append("  " + line)
+            }
+            let frame = Layout.frame(
+                title: "PicPicker · 第 \(group.id) 组",
+                subtitle: "\(cursor + 1)/\(records.count)",
+                body: body,
+                footer: "\(Ansi.bold)[ ]←→\(Ansi.reset) 上一张/下一张  \(Ansi.bold)x\(Ansi.reset) 排除这张  "
+                    + "\(Ansi.bold)Enter\(Ansi.reset) 指定为最佳  \(Ansi.bold)v/Esc\(Ansi.reset) 返回",
+                width: width
+            )
+            Terminal.home()
+            Terminal.write(frame)
+
+            guard let key = Key.read() else { return }
+            switch key {
+            case .escape, .character("v"), .character("q"), .control("c"):
+                return
+            case .left, .character("["), .up, .character("k"):
+                cursor = max(0, cursor - 1)
+            case .right, .character("]"), .down, .character("j"):
+                cursor = min(records.count - 1, cursor + 1)
+            case .enter:
+                model.setWinner(record)
+                return
+            case .character("x"):
+                model.setExcluded(record, excluded: true)
+                return
+            default:
+                break
+            }
+        }
+    }
+
+    private static func scoreLine(_ record: ImageRecord) -> String {
+        var parts = ["评分 \(String(format: "%.3f", record.score))"]
+        if let aesthetics = record.aesthetics {
+            parts.append("美学 \(String(format: "%.2f", aesthetics))")
+        }
+        if let face = record.faceQuality {
+            parts.append("人像 \(record.faceCount)人/\(String(format: "%.2f", face))")
+        }
+        if let angle = record.horizonAngle {
+            parts.append("地平 \(String(format: "%.0f°", angle))")
+        }
+        if record.hasYellowFlag {
+            parts.append("黄标 \(record.yellowReasonText)")
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    private static func fallbackLines(for record: ImageRecord) -> [String] {
+        var lines = ["", "\(Ansi.gray)无法在终端中渲染该图片，按 o 用默认看图程序打开。\(Ansi.reset)"]
+        if let error = record.error {
+            lines.append("\(Ansi.red)\(error)\(Ansi.reset)")
+        }
+        return lines
     }
 
     static func folderHasManifest(_ folder: URL) -> Bool {
@@ -713,6 +869,17 @@ enum GroupListScreen {
                     + "\(Ansi.yellow)黄标 \(summary.yellowFlagged) 张仍参选（闭眼/断头）\(Ansi.reset)"
             )
         }
+        let manualExcluded = snapshot.records.filter(\.isUserExcluded).count
+        let manualPinned = snapshot.groups.filter { $0.winner.isUserWinner }.count
+        if manualExcluded > 0 || manualPinned > 0 {
+            var parts: [String] = []
+            if manualPinned > 0 { parts.append("\(manualPinned) 组手动指定最佳") }
+            if manualExcluded > 0 { parts.append("\(manualExcluded) 张手动排除") }
+            body.append(
+                "  \(Ansi.cyan)手动调整\(Ansi.reset) \(parts.joined(separator: " · "))"
+                    + "\(Ansi.gray)（R 重置）\(Ansi.reset)"
+            )
+        }
         if snapshot.stage == .reviewing {
             body.append(
                 "  \(Ansi.gray)相似阈值\(Ansi.reset) \(String(format: "%.2f", snapshot.threshold)) "
@@ -733,8 +900,9 @@ enum GroupListScreen {
         switch snapshot.stage {
         case .reviewing:
             footer = "\(Ansi.bold)↑↓\(Ansi.reset) 切换组  \(Ansi.bold)←→ / +-\(Ansi.reset) 阈值  "
-                + "\(Ansi.bold)Enter\(Ansi.reset) 执行  \(Ansi.bold)d\(Ansi.reset) 试运行  "
-                + "\(Ansi.bold)o\(Ansi.reset) 打开最佳  \(Ansi.bold)c\(Ansi.reset) 复制  \(Ansi.bold)Esc\(Ansi.reset) 退出"
+                + "\(Ansi.bold)[ ]\(Ansi.reset) 改最佳  \(Ansi.bold)x\(Ansi.reset) 排除  \(Ansi.bold)s\(Ansi.reset) 跳过组  "
+                + "\(Ansi.bold)v\(Ansi.reset) 大图  \(Ansi.bold)f\(Ansi.reset) Finder  \(Ansi.bold)o\(Ansi.reset) 打开  "
+                + "\(Ansi.bold)Enter\(Ansi.reset) 执行  \(Ansi.bold)d\(Ansi.reset) 试运行  \(Ansi.bold)Esc\(Ansi.reset) 退出"
         case .applying:
             footer = "\(Ansi.green)\(snapshot.progressNote)\(Ansi.reset)"
         case .finished:
@@ -773,6 +941,7 @@ enum GroupListScreen {
                 + "\(Ansi.gray) · \(group.records.count) 张重复"
                 + (group.isBurst ? " · \(Ansi.yellow)连拍\(Ansi.gray)" : "")
                 + " · 最佳 \(best.plannedDisplayPath)\(Ansi.reset)"
+                + (best.isUserWinner ? "\(Ansi.cyan) (手动)\(Ansi.reset)" : "")
         )
         lines.append("")
 

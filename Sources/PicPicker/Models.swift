@@ -127,6 +127,10 @@ final class ImageRecord: @unchecked Sendable {
     var groupID: Int?
     var targetName: String?
     var distanceToBest: Double?
+    /// 审阅阶段手动排除：不参与重命名，也不写入任何标签。
+    var isUserExcluded = false
+    /// 审阅阶段手动指定为组内最佳。
+    var isUserWinner = false
     var error: String?
     var relativeDirectory = ""
 
