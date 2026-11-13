@@ -337,4 +337,66 @@ final class PicPickerTests: XCTestCase {
         XCTAssertEqual(plans.first { $0.0 === raw }?.1, "3-IMG_4498.CR3")
         XCTAssertEqual(jpeg.targetName, "3-IMG_4498.JPG")
     }
+
+    func testMissingFileDoesNotAbortOtherRenames() throws {
+        let folder = FileManager.default.temporaryDirectory
+            .appendingPathComponent("picpicker-partial-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+
+        let keep = folder.appendingPathComponent("IMG_0001.jpg")
+        let gone = folder.appendingPathComponent("IMG_0002.jpg")
+        for url in [keep, gone] {
+            FileManager.default.createFile(atPath: url.path, contents: Data([0xFF, 0xD8, 0xFF, 0xD9]))
+        }
+        let first = ImageRecord(url: keep)
+        let second = ImageRecord(url: gone)
+        for record in [first, second] {
+            record.aesthetics = 0.5
+            record.exposure = 0.5
+        }
+        let group = PhotoGroup(id: 1, records: [first, second], winner: first)
+        try FileManager.default.removeItem(at: gone)
+
+        let report = try FileActions.apply(groups: [group], folder: folder, records: [first, second])
+
+        XCTAssertEqual(report.renamedCount, 1, "另一张应照常改名")
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: folder.appendingPathComponent("1-IMG_0001.jpg").path)
+        )
+        XCTAssertEqual(report.failures.count, 1)
+        XCTAssertTrue(report.failures[0].contains("IMG_0002.jpg"))
+    }
+
+    func testLockedFileIsReportedAndOthersStillRename() throws {
+        let folder = FileManager.default.temporaryDirectory
+            .appendingPathComponent("picpicker-lock-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+
+        let free = folder.appendingPathComponent("IMG_0001.jpg")
+        let locked = folder.appendingPathComponent("IMG_0002.jpg")
+        for url in [free, locked] {
+            FileManager.default.createFile(atPath: url.path, contents: Data([0xFF, 0xD8, 0xFF, 0xD9]))
+        }
+        try FileManager.default.setAttributes([.immutable: true], ofItemAtPath: locked.path)
+        defer { try? FileManager.default.setAttributes([.immutable: false], ofItemAtPath: locked.path) }
+
+        let first = ImageRecord(url: free)
+        let second = ImageRecord(url: locked)
+        for record in [first, second] {
+            record.aesthetics = 0.5
+            record.exposure = 0.5
+            record.isJPG = true
+        }
+        let group = PhotoGroup(id: 1, records: [first, second], winner: first)
+
+        let report = try FileActions.apply(groups: [group], folder: folder, records: [first, second])
+
+        XCTAssertEqual(report.renamedCount, 1)
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: folder.appendingPathComponent("1-IMG_0001.jpg").path)
+        )
+        XCTAssertTrue(report.failures.contains { $0.contains("锁定") && $0.contains("IMG_0002.jpg") })
+    }
 }

@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 struct RenameRecord: Codable {
@@ -79,6 +80,10 @@ enum FileActions {
         var result = PreprocessResult()
 
         for record in records where record.isAnalyzed && !record.isUserExcluded {
+            if isLocked(record.url) {
+                result.failures.append("文件被锁定（uchg），跳过标签与移动 \(record.sortKey)")
+                continue
+            }
             if record.isExcludedFromPicking {
                 do {
                     let previousTags = FinderTags.read(from: record.url)
@@ -248,6 +253,7 @@ enum FileActions {
     static func apply(groups: [PhotoGroup], folder: URL, records: [ImageRecord]) throws -> ApplyReport {
         var report = ApplyReport()
         let root = folder.standardizedFileURL
+        report.failures.append(contentsOf: lockedFolderNotices(records: records, groups: groups))
         let preprocessResult = preprocess(records: records, root: root)
         report.highISOMarkedCount = records.filter {
             $0.isAnalyzed && $0.isHighISOJPG && !$0.isUserExcluded
@@ -290,14 +296,32 @@ enum FileActions {
             staging.append((record, record.url, temporary, target, relativeDir))
         }
 
+        // 单个文件失败不应该拖垮整批：先统一改成临时名（避免互相占名），
+        // 再逐个落到目标名，遇到问题只回滚这一个文件并记录原因。
         var movedToTemp: [(record: ImageRecord, original: URL, temporary: URL, target: URL, directory: String)] = []
-        do {
-            for item in staging {
+        for item in staging {
+            guard FileManager.default.fileExists(atPath: item.original.path) else {
+                report.failures.append("文件已不存在，跳过 \(item.record.originalName)")
+                continue
+            }
+            guard !isLocked(item.original) else {
+                report.failures.append(
+                    "文件被锁定（uchg），跳过 \(item.record.originalName)；可执行 chflags nouchg 解锁后重跑"
+                )
+                continue
+            }
+            do {
                 try FileManager.default.moveItem(at: item.original, to: item.temporary)
                 movedToTemp.append(item)
+            } catch {
+                report.failures.append(
+                    "改名失败 \(item.record.originalName): \(error.localizedDescription)"
+                )
             }
+        }
 
-            for item in movedToTemp {
+        for item in movedToTemp {
+            do {
                 let previousTags = FinderTags.read(from: item.temporary)
                 try FileManager.default.moveItem(at: item.temporary, to: item.target)
                 report.renamedCount += 1
@@ -313,18 +337,18 @@ enum FileActions {
                         previousTags: previousTags
                     )
                 )
-            }
-        } catch {
-            for item in movedToTemp.reversed() {
+            } catch {
+                // 只恢复这一个文件，其余成功的结果保留。
                 if FileManager.default.fileExists(atPath: item.temporary.path) {
                     try? FileManager.default.moveItem(at: item.temporary, to: item.original)
                 } else if FileManager.default.fileExists(atPath: item.target.path),
                           !FileManager.default.fileExists(atPath: item.original.path) {
                     try? FileManager.default.moveItem(at: item.target, to: item.original)
                 }
+                report.failures.append(
+                    "改名失败 \(item.record.originalName): \(error.localizedDescription)"
+                )
             }
-            report.failures.append("重命名失败，已尝试回滚: \(error.localizedDescription)")
-            return report
         }
 
         let manifestEntries = makeManifestEntries(report: report, preprocess: preprocessResult)
@@ -375,6 +399,9 @@ enum FileActions {
             report.undoURL = manifestURL
         }
 
+        // 同一张照片的重命名、锁定、标签可能各报一次，按内容去重，别让界面被重复项淹没。
+        var seen = Set<String>()
+        report.failures = report.failures.filter { seen.insert($0).inserted }
         return report
     }
 
@@ -566,6 +593,40 @@ enum FileActions {
             try? FileManager.default.removeItem(at: current)
             current = current.deletingLastPathComponent().standardizedFileURL
         }
+    }
+
+    /// 用户不可变标志（Finder 里“锁定”），改名和写标签都会被系统拒绝。
+    static func isLocked(_ url: URL) -> Bool {
+        var info = stat()
+        guard lstat(url.path, &info) == 0 else { return false }
+        return info.st_flags & UInt32(UF_IMMUTABLE) != 0
+            || info.st_flags & UInt32(SF_IMMUTABLE) != 0
+    }
+
+    /// 整个目录被锁定时里面的文件都改不了名，提前提示一次，避免刷出一堆错误。
+    private static func lockedFolderNotices(
+        records: [ImageRecord],
+        groups: [PhotoGroup]
+    ) -> [String] {
+        var seen = Set<String>()
+        var notices: [String] = []
+        func inspect(_ url: URL) {
+            let directory = url.deletingLastPathComponent()
+            guard !seen.contains(directory.path) else { return }
+            seen.insert(directory.path)
+            if isLocked(directory) {
+                notices.append("目录被锁定（uchg），本目录下的照片不会改名: \(directory.lastPathComponent)")
+            }
+        }
+        for record in records where !record.isAnalyzed && !record.isUserExcluded {
+            inspect(record.url)
+        }
+        for group in groups {
+            for record in group.records {
+                inspect(record.url)
+            }
+        }
+        return notices
     }
 
     private static func strippingNumericPrefix(from name: String) -> String {

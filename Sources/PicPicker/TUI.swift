@@ -964,6 +964,15 @@ enum GroupListScreen {
                 text += "  \(Ansi.yellow)\(failure)\(Ansi.reset)\n"
             }
         }
+        if let report = snapshot.applyReport, !report.failures.isEmpty {
+            text += "\n  \(Ansi.red)问题：\(Ansi.reset)\n"
+            for failure in report.failures.prefix(8) {
+                text += "  - \(Ansi.yellow)\(failure)\(Ansi.reset)\n"
+            }
+            if report.failures.count > 8 {
+                text += "  \(Ansi.gray)… 另有 \(report.failures.count - 8) 条\(Ansi.reset)\n"
+            }
+        }
         return Screen(text: text)
     }
 
