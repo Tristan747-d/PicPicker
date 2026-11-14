@@ -314,6 +314,38 @@ final class PicPickerTests: XCTestCase {
         XCTAssertTrue(record.isExcludedFromPicking)
     }
 
+    func testToneAnalyzerKeepsNightPhotoWithDetail() throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("tone-\(UUID().uuidString).jpg")
+        // 大片纯黑 + 有结构的亮部：夜景，不该判死黑。
+        let image = try XCTUnwrap(Self.makeImage(width: 120, height: 120) { context in
+            context.setFillColor(CGColor(red: 0, green: 0, blue: 0, alpha: 1))
+            context.fill(CGRect(x: 0, y: 0, width: 120, height: 60))
+            for index in 0..<60 {
+                let level = CGFloat(index) / 59
+                context.setFillColor(CGColor(red: level, green: level, blue: level, alpha: 1))
+                context.fill(CGRect(x: index * 2, y: 60, width: 2, height: 60))
+            }
+        })
+        let tone = ToneAnalyzer.analyze(url: url, isRaw: false, image: image)
+        XCTAssertGreaterThan(tone.blackFraction, 0.4)
+        XCTAssertFalse(tone.isDeadBlack, "有细节的夜景不该判死黑")
+    }
+
+    func testToneAnalyzerFlagsFlatBlackBlob() throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("tone-\(UUID().uuidString).jpg")
+        // 大半画面纯黑，剩下部分也是一片平坦 → 确实拍废了。
+        let image = try XCTUnwrap(Self.makeImage(width: 120, height: 120) { context in
+            context.setFillColor(CGColor(red: 0, green: 0, blue: 0, alpha: 1))
+            context.fill(CGRect(x: 0, y: 0, width: 120, height: 96))
+            context.setFillColor(CGColor(red: 0.12, green: 0.12, blue: 0.12, alpha: 1))
+            context.fill(CGRect(x: 0, y: 96, width: 120, height: 24))
+        })
+        let tone = ToneAnalyzer.analyze(url: url, isRaw: false, image: image)
+        XCTAssertTrue(tone.isDeadBlack)
+    }
+
     func testRawJpegPairUsesRawOnly() {
         let raw = URL(fileURLWithPath: "/tmp/IMG_4498.CR3")
         let jpeg = URL(fileURLWithPath: "/tmp/IMG_4498.JPG")
@@ -398,5 +430,213 @@ final class PicPickerTests: XCTestCase {
             FileManager.default.fileExists(atPath: folder.appendingPathComponent("1-IMG_0001.jpg").path)
         )
         XCTAssertTrue(report.failures.contains { $0.contains("锁定") && $0.contains("IMG_0002.jpg") })
+    }
+
+    // MARK: - 像素级重复复核
+
+    private func grayImage(
+        width: Int = 256,
+        height: Int = 256,
+        _ value: (Int, Int) -> Double
+    ) -> CGImage {
+        var buffer = [UInt8](repeating: 0, count: width * height)
+        for y in 0..<height {
+            for x in 0..<width {
+                buffer[y * width + x] = UInt8(min(255, max(0, value(x, y).rounded())))
+            }
+        }
+        return buffer.withUnsafeMutableBytes { raw -> CGImage in
+            let context = CGContext(
+                data: raw.baseAddress,
+                width: width,
+                height: height,
+                bitsPerComponent: 8,
+                bytesPerRow: width,
+                space: CGColorSpaceCreateDeviceGray(),
+                bitmapInfo: CGImageAlphaInfo.none.rawValue
+            )!
+            return context.makeImage()!
+        }
+    }
+
+    private func signature(_ image: CGImage) -> ThumbnailSignature {
+        GrayImage(cgImage: image)!.thumbnailSignature()
+    }
+
+    /// 有细节、有结构的测试图案，避免平滑图让相关性失真。
+    private func scenePattern(_ x: Int, _ y: Int) -> Double {
+        let base = sin(Double(x) / 9) * cos(Double(y) / 11)
+        let detail = sin(Double(x + y) / 3.5) * cos(Double(x - y) / 4.5)
+        let blob = exp(-(pow(Double(x) - 90, 2) + pow(Double(y) - 160, 2)) / 2000)
+        return 128 + base * 55 + detail * 25 + blob * 90
+    }
+
+    func testStructuralMatchAcceptsBrightnessAndCropVariants() {
+        let base = signature(grayImage(scenePattern))
+        let brighter = signature(grayImage { x, y in
+            scenePattern(x, y) * 0.85 + 28
+        })
+        let cropped = signature(grayImage { x, y in
+            scenePattern(
+                Int((Double(x) - 127.5) * 1.06 + 127.5),
+                Int((Double(y) - 127.5) * 1.06 + 127.5)
+            )
+        })
+
+        for variant in [brighter, cropped] {
+            let score = SimilarityIndex.compare(base, variant)
+            let requirement = SimilarityIndex.structuralRequirement(threshold: 0.28)
+            XCTAssertGreaterThan(score.luma, requirement, "亮度相关过低")
+            XCTAssertGreaterThan(score.edge, requirement - 0.10, "梯度相关过低")
+        }
+    }
+
+    func testStructuralMatchRejectsDifferentScenes() {
+        let base = signature(grayImage(scenePattern))
+        let other = signature(grayImage { x, y in
+            120 + sin(Double(x) / 3.2) * sin(Double(y) / 4.7) * 80
+        })
+
+        let score = SimilarityIndex.compare(base, other)
+        XCTAssertLessThan(score.luma, 0.90)
+    }
+
+    func testThresholdMapsToStructuralRequirement() {
+        XCTAssertGreaterThan(
+            SimilarityIndex.structuralRequirement(threshold: 0.10),
+            SimilarityIndex.structuralRequirement(threshold: 0.28)
+        )
+        XCTAssertGreaterThan(
+            SimilarityIndex.structuralRequirement(threshold: 0.28),
+            SimilarityIndex.structuralRequirement(threshold: 0.60)
+        )
+        XCTAssertEqual(
+            SimilarityIndex.structuralRequirement(threshold: 0.28),
+            0.930,
+            accuracy: 0.005
+        )
+    }
+
+    // MARK: - 视觉模型复核
+
+    func testVisionEndpointNormalization() {
+        XCTAssertEqual(
+            VisionAssist.normalizeEndpoint("127.0.0.1:8080")?.absoluteString,
+            "http://127.0.0.1:8080/v1"
+        )
+        XCTAssertEqual(
+            VisionAssist.normalizeEndpoint("http://127.0.0.1:8080/v1/")?.absoluteString,
+            "http://127.0.0.1:8080/v1"
+        )
+        XCTAssertEqual(
+            VisionAssist.normalizeEndpoint("http://localhost:1234")?.absoluteString,
+            "http://localhost:1234/v1"
+        )
+        XCTAssertNil(VisionAssist.normalizeEndpoint("   "))
+    }
+
+    func testVisionAnswerParsing() {
+        XCTAssertEqual(VisionAssist.parseYesNo("YES"), true)
+        XCTAssertEqual(VisionAssist.parseYesNo("是，同一张"), true)
+        XCTAssertEqual(VisionAssist.parseYesNo("NO，不同瞬间"), false)
+        XCTAssertEqual(VisionAssist.parseYesNo("不是同一张"), false)
+        XCTAssertNil(VisionAssist.parseYesNo("这两张照片里有人"))
+    }
+
+    func testGrayBandPairsOnlyAskForAmbiguousPairs() {
+        let base = signature(grayImage(scenePattern))
+        let other = signature(grayImage { x, y in
+            120 + sin(Double(x) / 3.2) * sin(Double(y) / 4.7) * 80
+        })
+        let requirement = SimilarityIndex.structuralRequirement(threshold: 0.28)
+        // 把另一张图按不同比例混进来，找一个刚好落进灰区的版本。
+        let nearMiss = stride(from: 0.02, through: 0.6, by: 0.02)
+            .lazy
+            .map { self.blend(base, other, ratio: $0) }
+            .first { SimilarityIndex.needsModel(SimilarityIndex.compare(base, $0), requirement: requirement) }
+        let ambiguousSignature = try? XCTUnwrap(nearMiss)
+        XCTAssertNotNil(ambiguousSignature, "应能构造出灰区样本")
+        guard let ambiguousSignature else { return }
+        let different = signature(grayImage { x, y in
+            100 + cos(Double(x) / 7.3) * 90 + sin(Double(y) / 2.1) * 40
+        })
+
+        let similar = ImageRecord(url: URL(fileURLWithPath: "/tmp/a.jpg"))
+        let ambiguous = ImageRecord(url: URL(fileURLWithPath: "/tmp/b.jpg"))
+        let unrelated = ImageRecord(url: URL(fileURLWithPath: "/tmp/c.jpg"))
+        similar.signature = base
+        ambiguous.signature = ambiguousSignature
+        unrelated.signature = different
+        for record in [similar, ambiguous, unrelated] {
+            record.dHash = 0
+        }
+
+        let index = SimilarityIndex(records: [similar, ambiguous, unrelated])
+        let pending = index.grayBandPairs(threshold: 0.28)
+        XCTAssertEqual(pending.count, 1)
+        XCTAssertTrue(pending.contains { $0.lhs === similar && $0.rhs === ambiguous })
+    }
+
+    func testGrayBandCoversOnlyBorderlineScores() {
+        let requirement = SimilarityIndex.structuralRequirement(threshold: 0.28)
+        // 像素刚够、或者差一点没够，都要问模型。
+        XCTAssertTrue(SimilarityIndex.needsModel(
+            StructuralScore(luma: requirement + 0.02, edge: requirement),
+            requirement: requirement
+        ))
+        XCTAssertTrue(SimilarityIndex.needsModel(
+            StructuralScore(luma: requirement - 0.05, edge: requirement - 0.1),
+            requirement: requirement
+        ))
+        // 像素很确信时不必问；差得太远也不必问。
+        XCTAssertFalse(SimilarityIndex.needsModel(
+            StructuralScore(luma: 0.99, edge: 0.97),
+            requirement: requirement
+        ))
+        XCTAssertFalse(SimilarityIndex.needsModel(
+            StructuralScore(luma: requirement - 0.3, edge: requirement - 0.3),
+            requirement: requirement
+        ))
+    }
+
+    private func blend(
+        _ lhs: ThumbnailSignature,
+        _ rhs: ThumbnailSignature,
+        ratio: Double
+    ) -> ThumbnailSignature {
+        func mix(_ a: [UInt8], _ b: [UInt8]) -> [UInt8] {
+            zip(a, b).map { first, second in
+                UInt8(clamping: Int((Double(first) * (1 - ratio) + Double(second) * ratio).rounded()))
+            }
+        }
+        return ThumbnailSignature(
+            luma: mix(lhs.luma, rhs.luma),
+            edge: mix(lhs.edge, rhs.edge),
+            coarse: mix(lhs.coarse, rhs.coarse)
+        )
+    }
+
+    func testGroupingRequiresPixelLevelMatch() {
+        let original = ImageRecord(url: URL(fileURLWithPath: "/tmp/DSC3345.jpg"))
+        let brighterCopy = ImageRecord(url: URL(fileURLWithPath: "/tmp/DSC3346.jpg"))
+        let different = ImageRecord(url: URL(fileURLWithPath: "/tmp/DSC3347.jpg"))
+        original.signature = signature(grayImage(scenePattern))
+        brighterCopy.signature = signature(grayImage { x, y in
+            scenePattern(x, y) * 0.9 + 20
+        })
+        different.signature = signature(grayImage { x, y in
+            120 + sin(Double(x) / 3.2) * sin(Double(y) / 4.7) * 80
+        })
+        // 没有 Vision 指纹时用 dHash 补候选，像素复核才是最终判据。
+        for record in [original, brighterCopy, different] {
+            record.dHash = 0
+        }
+
+        let grouped = SimilarityIndex(records: [original, brighterCopy, different])
+            .groups(threshold: 0.28)
+
+        XCTAssertEqual(grouped.count, 1)
+        XCTAssertEqual(grouped.first?.records.count, 2)
+        XCTAssertFalse(grouped.first?.records.contains { $0 === different } ?? true)
     }
 }

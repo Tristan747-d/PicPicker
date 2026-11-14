@@ -14,13 +14,18 @@ struct Options {
     var isoLimit: Int = 16_000
     var blurRatio: Double = 0.50
     var eyeRatio: Double = 0.20
+    var vlmEndpoint: URL?
+    var vlmModel: String = "default"
+    var vlmPairs: Bool = false
+    var dumpPairsPath: String?
+    var profilePath: String?
     var showHelp: Bool = false
 
     static let usage = """
     用法: picpicker [选项]
 
       --folder <路径>     递归处理指定文件夹及其子文件夹（跳过选择框）
-      --threshold <数值>  相似分组阈值，默认 0.28
+      --threshold <数值>  分组严格度，越小越严格，默认 0.28
       --iso-limit <数值>  JPG 高 ISO 红标阈值，默认 16000
       --blur-ratio <数值> 虚焦相对阈值，默认 0.50（越小越严格）
       --eye-ratio <数值>  闭眼 EAR 阈值，默认 0.20（越小越严格）
@@ -30,6 +35,11 @@ struct Options {
       --undo              撤销本文件夹上一次重命名
       --prefer-raw        同名的 RAW+JPG 只分析 RAW，JPG 跟随 RAW 一起改名
       --global-blur       关闭按机型的虚焦校准，改用全批中位数
+      --vlm <地址>        用本机视觉模型复核拿不准的照片对，例如 http://127.0.0.1:8080/v1
+      --vlm-model <名称>  视觉模型的模型名，默认 default
+      --vlm-pairs         额外让视觉模型复核“拿不准的重复候选”（较慢）
+      --dump-pairs <文件> 导出候选照片对的像素特征（离线标定用，不改文件）
+      --profile <文件>    使用指定的分组参数 JSON（默认 ~/.config/picpicker/grouping.json）
       -h, --help          显示帮助
     """
 
@@ -83,6 +93,27 @@ struct Options {
                 options.preferRaw = true
             case "--global-blur":
                 options.globalBlur = true
+            case "--vlm":
+                if let value = nextValue(arg) {
+                    options.vlmEndpoint = VisionAssist.normalizeEndpoint(value)
+                    if options.vlmEndpoint == nil {
+                        FileHandle.standardError.write(Data("无效的 --vlm 地址: \(value)\n".utf8))
+                    }
+                }
+            case "--vlm-model":
+                if let value = nextValue(arg), !value.isEmpty {
+                    options.vlmModel = value
+                }
+            case "--vlm-pairs":
+                options.vlmPairs = true
+            case "--dump-pairs":
+                if let value = nextValue(arg) {
+                    options.dumpPairsPath = (value as NSString).expandingTildeInPath
+                }
+            case "--profile":
+                if let value = nextValue(arg) {
+                    options.profilePath = (value as NSString).expandingTildeInPath
+                }
             case "-h", "--help":
                 options.showHelp = true
             default:
@@ -105,6 +136,8 @@ final class ImageRecord: @unchecked Sendable {
     let originalName: String
 
     var featurePrint: FeaturePrintObservation?
+    /// 内容近似判定的像素级签名：缩略亮度 + 梯度图。
+    var signature: ThumbnailSignature?
     var dHash: UInt64?
     var aesthetics: Double?
     var isUtility = false
@@ -233,6 +266,18 @@ struct PhotoGroup: @unchecked Sendable {
         }
         return (last - first) <= max(2, (numbers.count - 1) * 3)
     }
+}
+
+/// 用于像素级复核的小图签名。特征指纹只能判断“同一个场景”，
+/// 这里的亮度/梯度相关性才能区分“同一个瞬间”。
+struct ThumbnailSignature: Sendable {
+    static let side = 96
+    static let coarseSide = 24
+
+    let luma: [UInt8]
+    let edge: [UInt8]
+    /// 粗对齐用小图：比 96×96 快 16 倍，先把平移量找出来。
+    let coarse: [UInt8]
 }
 
 struct AnalysisSummary {

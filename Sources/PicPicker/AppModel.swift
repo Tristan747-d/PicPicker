@@ -17,6 +17,7 @@ final class AppModel: @unchecked Sendable {
         var undoReport: UndoReport?
         var errorMessage: String?
         var progressNote: String
+        var visionNote: String
         var isPreview: Bool
     }
 
@@ -36,6 +37,7 @@ final class AppModel: @unchecked Sendable {
     private var undoReport: UndoReport?
     private var errorMessage: String?
     private var progressNote = ""
+    private var visionNote = ""
     private var similarityIndex: SimilarityIndex?
     private var recomputeGeneration = 0
     private var baseGroups: [PhotoGroup] = []
@@ -46,6 +48,11 @@ final class AppModel: @unchecked Sendable {
     var dryRun: Bool
     var preferRaw: Bool
     var cameraBlur: Bool
+    /// 离线标定：把候选照片对的像素特征写到这里。
+    var dumpPairsPath: String?
+    var groupingProfile: GroupingProfile
+    /// 本机视觉模型（OpenAI 兼容接口）；为 nil 时只用像素比对。
+    var visionAssist: VisionAssist?
     private var isPreview = false
 
     init(
@@ -54,7 +61,10 @@ final class AppModel: @unchecked Sendable {
         jsonOutput: Bool = false,
         dryRun: Bool = false,
         preferRaw: Bool = false,
-        cameraBlur: Bool = true
+        cameraBlur: Bool = true,
+        visionConfiguration: VisionConfiguration? = nil,
+        dumpPairsPath: String? = nil,
+        groupingProfile: GroupingProfile = .default
     ) {
         self.threshold = threshold
         self.autoApply = autoApply
@@ -62,6 +72,9 @@ final class AppModel: @unchecked Sendable {
         self.dryRun = dryRun
         self.preferRaw = preferRaw
         self.cameraBlur = cameraBlur
+        self.visionAssist = visionConfiguration.map(VisionAssist.init(configuration:))
+        self.dumpPairsPath = dumpPairsPath
+        self.groupingProfile = groupingProfile
     }
 
     func snapshot() -> Snapshot {
@@ -83,6 +96,7 @@ final class AppModel: @unchecked Sendable {
             undoReport: undoReport,
             errorMessage: errorMessage,
             progressNote: progressNote,
+            visionNote: visionNote,
             isPreview: isPreview
         )
     }
@@ -137,6 +151,8 @@ final class AppModel: @unchecked Sendable {
                     }
                 }
 
+                await self.reviewDocumentFlags(analyzed)
+
                 self.mutate {
                     self.stage = .grouping
                     self.progressNote = "正在计算相似度并分组…"
@@ -182,8 +198,43 @@ final class AppModel: @unchecked Sendable {
                 }
 
                 let pickable = candidates.filter { !$0.isBlurry }
-                let index = SimilarityIndex(records: pickable)
-                let grouped = index.groups(threshold: self.currentThreshold)
+                let index = SimilarityIndex(records: pickable, profile: groupingProfile)
+                var grouped = index.groups(threshold: self.currentThreshold)
+                if let dumpPath = self.dumpPairsPath {
+                    let rows = index.calibrationRows(threshold: self.currentThreshold, root: folder)
+                    let header = "root\tdist\thash\tgap\tluma\tedge\tgrouped\ta\tb\tburst"
+                    let text = ([header] + rows).joined(separator: "\n") + "\n"
+                    try? text.write(toFile: dumpPath, atomically: true, encoding: .utf8)
+                }
+                let currentThreshold = self.currentThreshold
+                if let assist = self.visionAssist, assist.configuration.verifiesPairs {
+                    let pending = index.grayBandPairs(threshold: currentThreshold)
+                    if !pending.isEmpty {
+                        let pairs = pending.map {
+                            VisionPair(key: $0.key, lhs: $0.lhs, rhs: $0.rhs)
+                        }
+                        self.mutate {
+                            self.progressNote = "视觉模型复核 \(pairs.count) 对拿不准的照片…"
+                        }
+                        let outcome = await assist.verify(pairs: pairs) { done, total in
+                            self.mutate {
+                                self.progressNote = "视觉模型复核 \(done)/\(total) 对照片…"
+                            }
+                        }
+                        let note = Self.visionNoteText(outcome, endpoint: assist.endpointDescription)
+                        self.mutate {
+                            self.visionNote = self.visionNote.isEmpty
+                                ? note
+                                : "\(self.visionNote) · \(note)"
+                        }
+                        if !outcome.verdicts.isEmpty {
+                            grouped = index.groups(
+                                threshold: currentThreshold,
+                                verdicts: outcome.verdicts
+                            )
+                        }
+                    }
+                }
                 let companions = self.makeCompanions(
                     for: ordered,
                     pairing: pairing.companions,
@@ -450,6 +501,53 @@ final class AppModel: @unchecked Sendable {
             self.endedAt = Date()
             self.progressNote = ""
         }
+    }
+
+    /// 用视觉模型复核“文档/截图”红标；只有模型确认是屏幕/文档的才保留红标。
+    private func reviewDocumentFlags(_ analyzed: [ImageRecord]) async {
+        guard let assist = visionAssist else { return }
+        let flagged = analyzed.filter { record in
+            record.redReasons.contains { $0.hasPrefix("文档/截图") }
+        }
+        guard !flagged.isEmpty else { return }
+
+        self.mutate {
+            self.progressNote = "视觉模型复核 \(flagged.count) 张文档/截图判定…"
+        }
+        let review = await assist.reviewDocumentFlags(flagged) { done, total in
+            self.mutate {
+                self.progressNote = "视觉模型复核文档判定 \(done)/\(total)…"
+            }
+        }
+        self.mutate {
+            var cleared = 0
+            for record in flagged where review.realScene.contains(ObjectIdentifier(record)) {
+                record.redReasons.removeAll { $0.hasPrefix("文档/截图") }
+                record.isDocument = false
+                cleared += 1
+            }
+            var text = "文档/截图复核：撤销 \(cleared) 张、保留 \(review.confirmed) 张"
+            if review.failed > 0 {
+                text += "、\(review.failed) 张无响应"
+            }
+            self.visionNote = text
+        }
+    }
+
+    private static func visionNoteText(_ outcome: VisionOutcome, endpoint: String) -> String {
+        let confirmed = outcome.verdicts.values.filter { $0 }.count
+        let rejected = outcome.verdicts.count - confirmed
+        var text = "视觉模型复核 \(outcome.attempted) 对：确认 \(confirmed)、否决 \(rejected)"
+        if outcome.uncertain > 0 {
+            text += "、\(outcome.uncertain) 对结论不一致（按像素判定）"
+        }
+        if outcome.failed > 0 {
+            text += "、\(outcome.failed) 对无响应（检查 \(endpoint)）"
+        }
+        if outcome.truncated {
+            text += "，已达调用上限"
+        }
+        return text
     }
 
     private var currentThreshold: Double {

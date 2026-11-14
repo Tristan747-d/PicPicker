@@ -117,7 +117,7 @@ enum ImageAnalyzer {
             if metrics.headCutoff {
                 record.yellowReasons.append("断头")
             }
-            if (metrics.isDocument || metrics.isUtility), metrics.faceCount == 0 {
+            if metrics.isDocument, metrics.faceCount == 0 {
                 record.redReasons.append("文档/截图")
             }
             if let angle = metrics.horizonAngle,
@@ -165,6 +165,7 @@ enum ImageAnalyzer {
             record.sharpnessRaw = sharpness
             record.sharpness = normalizeSharpness(sharpness)
             record.dHash = gray.dHash()
+            record.signature = gray.thumbnailSignature()
             record.score = finalScore(for: record)
         } catch {
             record.error = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
@@ -355,7 +356,7 @@ enum ImageAnalyzer {
         let aestheticsScore = aesthetics.map { clamp((Double($0.overallScore) + 1) / 2) }
 
         let eyeAnalysis = analyzeEyes(landmarks.isEmpty ? faces : landmarks, imageSize: imageSize)
-        let detectedDocument = isDocument(document)
+        let detectedDocument = isDocumentLike(document, isUtility: aesthetics?.isUtility ?? false)
         let horizonAngle = horizon.map {
             $0.angle.converted(to: .degrees).value
         }
@@ -430,10 +431,22 @@ enum ImageAnalyzer {
         return (upperLowerA + upperLowerB) / (2 * horizontal)
     }
 
-    private static func isDocument(_ observation: DetectedDocumentObservation?) -> Bool {
+    /// 文档 / 截图只在证据充分时才判红标：
+    /// - 文档分割很确信且面积够大（明显的纸张/屏幕轮廓）；
+    /// - 或者文档分割 + Vision 的“工具类图片”判定同时成立。
+    /// 单独一个 `isUtility` 会在普通照片上误报，所以不再单独使用。
+    private static func isDocumentLike(
+        _ observation: DetectedDocumentObservation?,
+        isUtility: Bool
+    ) -> Bool {
         guard let observation else { return false }
-        guard observation.confidence >= 0.5 else { return false }
+        let confidence = Double(observation.confidence)
+        let area = documentArea(observation)
+        if confidence >= 0.90, area >= 0.15 { return true }
+        return confidence >= 0.50 && area >= 0.05 && isUtility
+    }
 
+    private static func documentArea(_ observation: DetectedDocumentObservation) -> Double {
         let corners = [
             observation.topLeft.cgPoint,
             observation.topRight.cgPoint,
@@ -446,7 +459,7 @@ enum ImageAnalyzer {
             let next = corners[(index + 1) % corners.count]
             area += Double(current.x * next.y - next.x * current.y)
         }
-        return abs(area) / 2 >= 0.05
+        return abs(area) / 2
     }
 
     private static func rotationDeviation(_ angle: Double) -> Double {
@@ -482,7 +495,7 @@ enum ImageAnalyzer {
     }
 }
 
-private struct GrayImage {
+struct GrayImage {
     let width: Int
     let height: Int
     let pixels: [UInt8]
@@ -661,5 +674,61 @@ private struct GrayImage {
             }
         }
         return hash
+    }
+
+    /// 缩到 96×96 的亮度图，并额外算一张梯度图。
+    /// 只用一张小图就能把“同场景不同瞬间”和“同一张照片”区分开。
+    func thumbnailSignature() -> ThumbnailSignature {
+        let side = ThumbnailSignature.side
+        var luma = [UInt8](repeating: 0, count: side * side)
+
+        for cellY in 0..<side {
+            let y0 = cellY * height / side
+            let y1 = max(y0 + 1, (cellY + 1) * height / side)
+            for cellX in 0..<side {
+                let x0 = cellX * width / side
+                let x1 = max(x0 + 1, (cellX + 1) * width / side)
+                var sum = 0
+                var count = 0
+                for y in y0..<min(y1, height) {
+                    let row = y * width
+                    for x in x0..<min(x1, width) {
+                        sum += Int(pixels[row + x])
+                        count += 1
+                    }
+                }
+                luma[cellY * side + cellX] = count > 0
+                    ? UInt8(sum / count)
+                    : 0
+            }
+        }
+
+        var edge = [UInt8](repeating: 0, count: side * side)
+        for y in 1..<(side - 1) {
+            let row = y * side
+            for x in 1..<(side - 1) {
+                let gx = Int(luma[row + x + 1]) - Int(luma[row + x - 1])
+                let gy = Int(luma[row + side + x]) - Int(luma[row - side + x])
+                edge[row + x] = UInt8(min(255, abs(gx) + abs(gy)))
+            }
+        }
+
+        let coarseSide = ThumbnailSignature.coarseSide
+        let factor = side / coarseSide
+        var coarse = [UInt8](repeating: 0, count: coarseSide * coarseSide)
+        for cellY in 0..<coarseSide {
+            for cellX in 0..<coarseSide {
+                var sum = 0
+                for y in 0..<factor {
+                    let row = (cellY * factor + y) * side
+                    for x in 0..<factor {
+                        sum += Int(luma[row + cellX * factor + x])
+                    }
+                }
+                coarse[cellY * coarseSide + cellX] = UInt8(sum / (factor * factor))
+            }
+        }
+
+        return ThumbnailSignature(luma: luma, edge: edge, coarse: coarse)
     }
 }

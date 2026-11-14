@@ -38,7 +38,16 @@ let model = AppModel(
     jsonOutput: options.json,
     dryRun: options.dryRun,
     preferRaw: options.preferRaw,
-    cameraBlur: !options.globalBlur
+    cameraBlur: !options.globalBlur,
+    visionConfiguration: options.vlmEndpoint.map {
+        VisionConfiguration(
+            endpoint: $0,
+            model: options.vlmModel,
+            verifiesPairs: options.vlmPairs
+        )
+    },
+    dumpPairsPath: options.dumpPairsPath,
+    groupingProfile: GroupingProfile.load(path: options.profilePath)
 )
 
 if folder == nil, !isInteractive, !options.undo {

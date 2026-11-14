@@ -903,6 +903,9 @@ enum GroupListScreen {
                     + "\(Ansi.yellow)黄标 \(summary.yellowFlagged) 张仍参选（闭眼/断头）\(Ansi.reset)"
             )
         }
+        if !snapshot.visionNote.isEmpty {
+            body.append("  \(Ansi.cyan)\(snapshot.visionNote)\(Ansi.reset)")
+        }
         let manualExcluded = snapshot.records.filter(\.isUserExcluded).count
         let manualPinned = snapshot.groups.filter { $0.winner.isUserWinner }.count
         if manualExcluded > 0 || manualPinned > 0 {

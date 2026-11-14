@@ -20,11 +20,15 @@ struct ToneClipping {
 
 enum ToneAnalyzer {
     /// 画面里超过这个比例没有高光/阴影细节，才视为“死白/死黑”并排除出选片。
-    static let deadAreaThreshold = 0.08
+    /// 面积小的高光/暗部（灯光、反光、夜景天空）是正常画面，不参与判定。
+    static let deadAreaThreshold = 0.35
     /// 只对超过这个比例的区域做 RAW 二次解码，避免拖慢整批扫描。
     static let rawCandidateThreshold = 0.03
     /// -3 EV 下区域标准差低于该值，说明拉回来依然没有结构。
     static let flatSigma = 3.0
+    /// 8 位图像没法二次解码，改用“未裁切部分是否还有细节”来判断：
+    /// 归一化标准差低于该值，说明画面剩下部分也是一片平坦。
+    static let flatDetailSigma = 0.10
 
     private static let whiteLevel: UInt8 = 254
     private static let blackLevel: UInt8 = 2
@@ -61,16 +65,18 @@ enum ToneAnalyzer {
 
         let hasCandidate = max(result.whiteFraction, result.blackFraction) >= rawCandidateThreshold
         guard isRaw, hasCandidate else {
-            result.isDeadWhite = result.whiteFraction >= deadAreaThreshold
-            result.isDeadBlack = result.blackFraction >= deadAreaThreshold
+            let isFlat = detailSigma(toneMap) < flatDetailSigma
+            result.isDeadWhite = isFlat && result.whiteFraction >= deadAreaThreshold
+            result.isDeadBlack = isFlat && result.blackFraction >= deadAreaThreshold
             return result
         }
 
         guard let whiteSigma = rawStructure(url: url, width: width, height: height, kind: .highlight),
               let blackSigma = rawStructure(url: url, width: width, height: height, kind: .shadow) else {
             // RAW 解码失败时退回保守判断：只按面积标记，不声称可恢复。
-            result.isDeadWhite = result.whiteFraction >= deadAreaThreshold
-            result.isDeadBlack = result.blackFraction >= deadAreaThreshold
+            let isFlat = detailSigma(toneMap) < flatDetailSigma
+            result.isDeadWhite = isFlat && result.whiteFraction >= deadAreaThreshold
+            result.isDeadBlack = isFlat && result.blackFraction >= deadAreaThreshold
             return result
         }
 
@@ -155,6 +161,25 @@ enum ToneAnalyzer {
             count += 1
             sum += value
             sumSquares += value * value
+        }
+        guard count > 0 else { return 0 }
+        let mean = sum / count
+        return max(0, sumSquares / count - mean * mean).squareRoot()
+    }
+
+    /// 去掉已经写到 255 / 0 的像素之后，剩下区域的归一化标准差。
+    ///
+    /// 夜景照片大片黑、逆光照片大片白都是正常画面；只有“剩下部分也没有细节”
+    /// 才说明这张确实拍废了。
+    private static func detailSigma(_ pixels: [UInt8]) -> Double {
+        var count = 0.0
+        var sum = 0.0
+        var sumSquares = 0.0
+        for value in pixels where value > blackLevel && value < whiteLevel {
+            let normalized = Double(value) / 255
+            count += 1
+            sum += normalized
+            sumSquares += normalized * normalized
         }
         guard count > 0 else { return 0 }
         let mean = sum / count
